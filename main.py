@@ -835,70 +835,6 @@ def main_app():
             st.error(f"Error executing corrected query: {e}")
             return None
 
-    def load_all_instructions(engine):
-        """
-        Load ALL instructions from INSTRUCTIONS_NEW table as a shared knowledge base
-        Only loads instructions where DELETED = FALSE
-        """
-        query = """
-        SELECT "INSTRUCTION" 
-        FROM ATI_AI_USAGE.INSTRUCTIONS_NEW
-        WHERE "DELETED" = FALSE
-        ORDER BY "INSTRUCTION"
-        """
-
-        try:
-            with engine.connect() as conn:
-                result = pd.read_sql(query, conn)
-
-            if result.empty:
-                return []
-
-            # Handle case sensitivity
-            for col in result.columns:
-                if col.upper() == 'INSTRUCTION':
-                    return result[col].tolist()
-
-            return []
-
-        except Exception as e:
-            print(f"Error loading instructions: {e}")
-            return []
-
-    def format_instructions_for_prompt(instructions):
-        """
-        Format instructions into a clear prompt section
-        """
-        if not instructions:
-            return ""
-
-        formatted = "\n\nSHARED KNOWLEDGE BASE (from all users):\n"
-        for i, instruction in enumerate(instructions, 1):
-            formatted += f"{i}. {instruction}\n"
-
-        formatted += "\nApply these rules when generating SQL queries where relevant.\n"
-
-        return formatted
-
-    def enhance_system_prompt_with_instructions(base_prompt, instructions):
-        """
-        Enhance the system prompt by adding shared instructions
-        """
-        if not instructions:
-            return base_prompt
-
-        instruction_section = format_instructions_for_prompt(instructions)
-
-        if "{schema_text}" in base_prompt:
-            enhanced_prompt = base_prompt.replace(
-                "{schema_text}",
-                "{schema_text}" + instruction_section
-            )
-        else:
-            enhanced_prompt = base_prompt + instruction_section
-
-        return enhanced_prompt
-
     def format_query_correction_response(correction_suggestions, original_query):
         """
         Format query correction suggestions into a user-friendly message
@@ -931,6 +867,75 @@ def main_app():
 
         return suggestion_message
 
+    def load_all_instructions(engine):
+        """
+        Load ALL instructions from INSTRUCTIONS_NEW table as a shared knowledge base
+        Only loads instructions where DELETED = FALSE
+        """
+        # Use quotes to preserve case in Snowflake
+        query = """
+        SELECT "INSTRUCTION" 
+        FROM ATI_AI_USAGE.INSTRUCTIONS_NEW
+        WHERE "DELETED" = FALSE
+        ORDER BY "INSTRUCTION"
+        """
+
+        try:
+            with engine.connect() as conn:
+                result = pd.read_sql(query, conn)
+
+            if result.empty:
+                return []
+
+            # The column might come back in different cases
+            for col in result.columns:
+                if col.upper() == 'INSTRUCTION':
+                    return result[col].tolist()
+
+            # If still not found, return empty
+            print(f"Column INSTRUCTION not found. Available columns: {result.columns.tolist()}")
+            return []
+
+        except Exception as e:
+            print(f"Error loading instructions: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def format_instructions_for_prompt(instructions):
+        """
+        Format instructions into a clear prompt section
+        """
+        if not instructions:
+            return ""
+
+        formatted = "\n\nSHARED KNOWLEDGE BASE INSTRUCTIONS (MUST FOLLOW):\n"
+        for i, instruction in enumerate(instructions, 1):
+            formatted += f"{i}. {instruction}\n"
+
+        formatted += "\nIMPORTANT: These are community-defined rules that must be incorporated into every SQL query where applicable.\n"
+
+        return formatted
+
+    def enhance_system_prompt_with_instructions(base_prompt, instructions):
+        """
+        Enhance the system prompt by adding shared instructions
+        """
+        if not instructions:
+            return base_prompt
+
+        instruction_section = format_instructions_for_prompt(instructions)
+
+        # Insert after schema_text placeholder
+        if "{schema_text}" in base_prompt:
+            enhanced_prompt = base_prompt.replace(
+                "{schema_text}",
+                "{schema_text}" + instruction_section
+            )
+        else:
+            enhanced_prompt = base_prompt + instruction_section
+
+        return enhanced_prompt
     def create_correction_dataframe(correction_suggestions):
         """
         Create a DataFrame to display correction suggestions
@@ -1089,7 +1094,12 @@ def main_app():
             # Reinitialize only the authentication state
             st.session_state["authenticated"] = False
             st.rerun()
-
+        # Add this in sidebar after the Learning Stats button
+        if "knowledge_base_instructions" in st.session_state and st.session_state.knowledge_base_instructions:
+            with st.expander("📚 Knowledge Base"):
+                st.markdown("*Shared instructions from all users:*")
+                for i, instruction in enumerate(st.session_state.knowledge_base_instructions, 1):
+                    st.markdown(f"{i}. {instruction}")
 
     # ----------------------------------
     #  B) MAIN: Chat interface
@@ -1168,41 +1178,39 @@ def main_app():
             schema_text += f"  - {col} (Data Type: {dtype})\n"
         schema_text += "\n"
 
+    # ENHANCED CODE - REPLACE WITH THIS:
     combined_template = fetch_system_prompt_sections()
 
-    # Always prepare base version (without instructions)
-    base_system_prompt = combined_template.format(
-        schema_text=schema_text,
-        user_email=st.session_state["user"]
-    )
-
-    # Prepare enhanced version with instructions
-    try:
+    # Check if we're in error clarification mode
+    if st.session_state.get("awaiting_error_clarification", False):
+        # Don't load instructions during error clarification
+        system_prompt = combined_template.format(
+            schema_text=schema_text,
+            user_email=st.session_state["user"]
+        )
+    else:
+        # Load ALL instructions from the knowledge base
         engine = get_snowflake_connection()
         all_instructions = load_all_instructions(engine)
 
+        # Enhance the template with instructions
         if all_instructions:
             enhanced_template = enhance_system_prompt_with_instructions(
                 combined_template,
                 all_instructions
             )
-            enhanced_system_prompt = enhanced_template.format(
-                schema_text=schema_text,
-                user_email=st.session_state["user"]
-            )
         else:
-            # If no instructions, use base prompt
-            enhanced_system_prompt = base_system_prompt
+            enhanced_template = combined_template
 
-    except Exception as e:
-        print(f"Error loading instructions, using base prompt: {e}")
-        enhanced_system_prompt = base_system_prompt
+        # Format with schema_text
+        system_prompt = enhanced_template.format(
+            schema_text=schema_text,
+            user_email=st.session_state["user"]
+        )
 
-    # Store system prompt in session state
+    # Store in session state
     if "system_prompt" not in st.session_state:
-        st.session_state.base_system_prompt = base_system_prompt
-        st.session_state.enhanced_system_prompt = enhanced_system_prompt
-        st.session_state.system_prompt = enhanced_system_prompt
+        st.session_state.system_prompt = system_prompt
 
         # Create chat_message_columns map to track which messages have tables
     if "chat_message_tables" not in st.session_state:
@@ -1227,16 +1235,10 @@ def main_app():
 
     def get_groq_response_with_system(conversation_messages):
         """Prepends the system prompt to conversation messages and calls the API"""
+        # Always prepend the system message to the conversation history
+        full_messages = [{"role": "system", "content": st.session_state.system_prompt}] + conversation_messages
 
-        # Use base prompt during error recovery/clarification
-        if (st.session_state.get("awaiting_error_clarification", False) or
-                st.session_state.get("awaiting_correction_submit", False) or
-                st.session_state.get("pending_corrected_sql")):
-            system_prompt = st.session_state.get("base_system_prompt", st.session_state.system_prompt)
-        else:
-            system_prompt = st.session_state.get("enhanced_system_prompt", st.session_state.system_prompt)
-
-        full_messages = [{"role": "system", "content": system_prompt}] + conversation_messages
+        # Call your existing implementation
         return get_groq_response(full_messages)
 
         # Function to handle table display based on row count
@@ -1254,7 +1256,7 @@ def main_app():
         # Get relevant clarifications
         clarifications = memory.get_relevant_clarifications(user_email, current_question, entities)
 
-        # If we have clarifications, enhance the system prompt
+        # If we have clarifications, they should OVERRIDE general instructions
         if clarifications:
             # Create enhanced messages with clarification context
             enhanced_messages = conversation_messages.copy()
@@ -1265,6 +1267,10 @@ def main_app():
                     enhanced_prompt, clarification_context = memory.apply_clarifications_to_prompt(
                         msg["content"], clarifications
                     )
+
+                    # CRITICAL: Add explicit instruction to prioritize clarifications
+                    enhanced_prompt += "\n\nCRITICAL: The clarifications above are from this specific user/context and MUST override any general knowledge base instructions that might conflict."
+
                     enhanced_messages[i] = {"role": "user", "content": enhanced_prompt}
 
                     # Show what clarifications were applied
@@ -1277,9 +1283,11 @@ def main_app():
                         st.info(f"📚 Applied learned clarifications: {', '.join(applied_items)}")
                     break
 
-            # Call the original function with enhanced messages
+            # Create a modified system prompt that explicitly states clarifications take precedence
+            modified_system_prompt = st.session_state.system_prompt + "\n\nIMPORTANT OVERRIDE: Any user-specific clarifications provided in the messages take absolute precedence over general knowledge base instructions."
+
             return get_groq_response(
-                [{"role": "system", "content": st.session_state.system_prompt}] + enhanced_messages
+                [{"role": "system", "content": modified_system_prompt}] + enhanced_messages
             )
         else:
             # No clarifications found, proceed normally
