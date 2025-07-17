@@ -1,0 +1,13 @@
+snowflake-connector-python
+grpcio==1.67.1
+python-dotenv
+sqlalchemy
+snowflake-sqlalchemy
+pandas
+streamlit
+groq
+streamlit-aggrid
+sqlglot
+fuzzywuzzy
+pyarrow==18.1.0
+python-Levenshtein
