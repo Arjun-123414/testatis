@@ -867,6 +867,32 @@ def main_app():
 
         return suggestion_message
 
+    def create_correction_dataframe(correction_suggestions):
+        """
+        Create a DataFrame to display correction suggestions
+
+        Args:
+            correction_suggestions (dict): Suggestions for query corrections
+
+        Returns:
+            pandas.DataFrame: Formatted suggestions DataFrame
+        """
+        import pandas as pd
+
+        # Prepare data for DataFrame
+        correction_data = []
+        for suggestion in correction_suggestions['suggestions']:
+            for suggested_value in suggestion['suggested_values']:
+                correction_data.append({
+                    'Column': suggestion['column'],
+                    'Original Value': suggestion['original_value'],
+                    'Suggested Value': suggested_value
+                })
+
+        # Create DataFrame
+        df = pd.DataFrame(correction_data)
+        return df
+
     def load_all_instructions(engine):
         """
         Load ALL instructions from INSTRUCTIONS_NEW table as a shared knowledge base
@@ -936,31 +962,6 @@ def main_app():
             enhanced_prompt = base_prompt + instruction_section
 
         return enhanced_prompt
-    def create_correction_dataframe(correction_suggestions):
-        """
-        Create a DataFrame to display correction suggestions
-
-        Args:
-            correction_suggestions (dict): Suggestions for query corrections
-
-        Returns:
-            pandas.DataFrame: Formatted suggestions DataFrame
-        """
-        import pandas as pd
-
-        # Prepare data for DataFrame
-        correction_data = []
-        for suggestion in correction_suggestions['suggestions']:
-            for suggested_value in suggestion['suggested_values']:
-                correction_data.append({
-                    'Column': suggestion['column'],
-                    'Original Value': suggestion['original_value'],
-                    'Suggested Value': suggested_value
-                })
-
-        # Create DataFrame
-        df = pd.DataFrame(correction_data)
-        return df
 
     def get_cached_schema_details(user_email):
         """Get schema details from cache or database"""
@@ -1094,12 +1095,21 @@ def main_app():
             # Reinitialize only the authentication state
             st.session_state["authenticated"] = False
             st.rerun()
-        # Add this in sidebar after the Learning Stats button
-        if "knowledge_base_instructions" in st.session_state and st.session_state.knowledge_base_instructions:
-            with st.expander("📚 Knowledge Base"):
-                st.markdown("*Shared instructions from all users:*")
-                for i, instruction in enumerate(st.session_state.knowledge_base_instructions, 1):
-                    st.markdown(f"{i}. {instruction}")
+        if st.button("📊 Learning Stats"):
+            memory = ClarificationMemory(get_snowflake_connection())
+            stats = memory.get_clarification_stats(st.session_state["user"])
+            if not stats.empty:
+                st.markdown("### 🧠 What I've Learned")
+                st.dataframe(stats)
+            else:
+                st.info("No clarifications learned yet")
+
+            # Add admin function to clean old clarifications (optional)
+        if st.session_state["user"].endswith("@admin.ahs.com"):  # Admin check
+            if st.button("🧹 Clean Old Clarifications"):
+                memory = ClarificationMemory(get_snowflake_connection())
+                memory.cleanup_old_clarifications(12)  # Clean > 12 months old
+                st.success("Cleaned old clarifications")
 
     # ----------------------------------
     #  B) MAIN: Chat interface
@@ -1181,36 +1191,26 @@ def main_app():
     # ENHANCED CODE - REPLACE WITH THIS:
     combined_template = fetch_system_prompt_sections()
 
-    # Check if we're in error clarification mode
-    if st.session_state.get("awaiting_error_clarification", False):
-        # Don't load instructions during error clarification
-        system_prompt = combined_template.format(
-            schema_text=schema_text,
-            user_email=st.session_state["user"]
-        )
-    else:
-        # Load ALL instructions from the knowledge base
-        engine = get_snowflake_connection()
-        all_instructions = load_all_instructions(engine)
+    # Load ALL instructions from the knowledge base
+    engine = get_snowflake_connection()
+    all_instructions = load_all_instructions(engine)
 
-        # Enhance the template with instructions
-        if all_instructions:
-            enhanced_template = enhance_system_prompt_with_instructions(
-                combined_template,
-                all_instructions
-            )
-        else:
-            enhanced_template = combined_template
+    # Enhance the template with instructions
+    enhanced_template = enhance_system_prompt_with_instructions(
+        combined_template,
+        all_instructions
+    )
 
-        # Format with schema_text
-        system_prompt = enhanced_template.format(
-            schema_text=schema_text,
-            user_email=st.session_state["user"]
-        )
+    # Format with schema_text
+    system_prompt = enhanced_template.format(
+        schema_text=schema_text,
+        user_email=st.session_state["user"]
+    )
 
-    # Store in session state
+    # Store both in session state
     if "system_prompt" not in st.session_state:
         st.session_state.system_prompt = system_prompt
+        st.session_state.knowledge_base_instructions = all_instructions
 
         # Create chat_message_columns map to track which messages have tables
     if "chat_message_tables" not in st.session_state:
@@ -1256,7 +1256,7 @@ def main_app():
         # Get relevant clarifications
         clarifications = memory.get_relevant_clarifications(user_email, current_question, entities)
 
-        # If we have clarifications, they should OVERRIDE general instructions
+        # If we have clarifications, enhance the system prompt
         if clarifications:
             # Create enhanced messages with clarification context
             enhanced_messages = conversation_messages.copy()
@@ -1267,10 +1267,6 @@ def main_app():
                     enhanced_prompt, clarification_context = memory.apply_clarifications_to_prompt(
                         msg["content"], clarifications
                     )
-
-                    # CRITICAL: Add explicit instruction to prioritize clarifications
-                    enhanced_prompt += "\n\nCRITICAL: The clarifications above are from this specific user/context and MUST override any general knowledge base instructions that might conflict."
-
                     enhanced_messages[i] = {"role": "user", "content": enhanced_prompt}
 
                     # Show what clarifications were applied
@@ -1283,11 +1279,9 @@ def main_app():
                         st.info(f"📚 Applied learned clarifications: {', '.join(applied_items)}")
                     break
 
-            # Create a modified system prompt that explicitly states clarifications take precedence
-            modified_system_prompt = st.session_state.system_prompt + "\n\nIMPORTANT OVERRIDE: Any user-specific clarifications provided in the messages take absolute precedence over general knowledge base instructions."
-
+            # Call the original function with enhanced messages
             return get_groq_response(
-                [{"role": "system", "content": modified_system_prompt}] + enhanced_messages
+                [{"role": "system", "content": st.session_state.system_prompt}] + enhanced_messages
             )
         else:
             # No clarifications found, proceed normally
