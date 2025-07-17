@@ -3,7 +3,7 @@
 import re
 from typing import Dict, List
 import streamlit as st
-from clarification_memory import ClarificationMemory  # ADD THIS IMPORT
+from sqlalchemy import text  # ADD THIS IMPORT
 
 
 def extract_all_filters_from_sql(sql_query: str) -> Dict[str, List[Dict]]:
@@ -209,6 +209,43 @@ def handle_ui_based_error_recovery(
     }
 
 
+def save_clarification_to_instructions(corrections: Dict[str, str], snowflake_engine) -> None:
+    """
+    Save user clarifications to INSTRUCTIONS_NEW table
+    """
+    try:
+        instructions_to_save = []
+
+        for key, description in corrections.items():
+            if key == "table":
+                # Skip table corrections for now, or handle differently if needed
+                continue
+            else:
+                # Extract the value from the key (format: "column:value")
+                if ":" in key:
+                    _, value = key.split(":", 1)
+                    # Create instruction in the format: "Elite Disaster Team : it is a vendors name"
+                    instruction = f"{value} : {description}"
+                    instructions_to_save.append(instruction)
+
+        # Save each instruction to the database
+        if instructions_to_save and snowflake_engine:
+            with snowflake_engine.connect() as conn:
+                for instruction in instructions_to_save:
+                    # Insert into INSTRUCTIONS_NEW table
+                    insert_query = text("""
+                        INSERT INTO ATI_AI_USAGE.INSTRUCTIONS_NEW ("INSTRUCTION", "DELETED")
+                        VALUES (:instruction, FALSE)
+                    """)
+                    conn.execute(insert_query, {"instruction": instruction})
+                    conn.commit()
+                    print(f"✅ Saved instruction: {instruction}")
+
+    except Exception as e:
+        print(f"❌ Error saving clarification to instructions: {e}")
+        # Don't fail the whole process if saving fails
+
+
 def process_ui_corrections(
         corrections: Dict[str, str],
         filter_info: Dict,
@@ -216,12 +253,12 @@ def process_ui_corrections(
         schema_text: str,
         groq_response_func,
         snowflake_engine=None,  # ADD THIS PARAMETER
-        user_email=None,         # ADD THIS PARAMETER
-        original_question=None   # ADD THIS PARAMETER
+        user_email=None,  # ADD THIS PARAMETER (kept for compatibility)
+        original_question=None  # ADD THIS PARAMETER (kept for compatibility)
 ) -> Dict:
     """
     Process UI corrections and generate fixed SQL
-    NOW WITH LEARNING: Saves clarifications for future use
+    NOW SAVES TO INSTRUCTIONS_NEW TABLE
     """
     if not corrections:
         return {
@@ -269,23 +306,10 @@ Corrected SQL:"""
     if fixed_sql.endswith("```"):
         fixed_sql = fixed_sql[:-3]
 
-    # ==== LEARNING MECHANISM: SAVE THE CLARIFICATION ====
-    if snowflake_engine and user_email and original_question:
-        try:
-            memory = ClarificationMemory(snowflake_engine)
-            memory.save_clarification(
-                user_email=user_email,
-                original_question=original_question,
-                original_sql=original_sql,
-                corrections=corrections,
-                corrected_sql=fixed_sql.strip(),
-                filter_info=filter_info
-            )
-            print(f"✅ Saved clarification for future learning: {list(corrections.keys())}")
-        except Exception as e:
-            print(f"❌ Error saving clarification to memory: {e}")
-            # Don't fail the whole process if saving fails
-    # ==== END LEARNING MECHANISM ====
+    # ==== SAVE TO INSTRUCTIONS_NEW TABLE ====
+    if snowflake_engine:
+        save_clarification_to_instructions(corrections, snowflake_engine)
+    # ==== END SAVE ====
 
     # Build summary of changes
     changes_summary = []
