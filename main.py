@@ -1587,53 +1587,76 @@ def main_app():
         """, unsafe_allow_html=True)
 
     if st.session_state.awaiting_simple_clarification and "simple_clarification_data" in st.session_state:
-        with st.container():
-            with st.chat_message("assistant"):
-                filter_info = st.session_state.simple_clarification_data.get("filter_info", {})
+        with st.chat_message("assistant"):
+            filter_info = st.session_state.simple_clarification_data.get("filter_info", {})
 
-                # Display the clarification UI
-                st.markdown(
-                    '''<div style="background-color:#f8fafc; border-radius:10px; padding:18px 20px 14px 20px; margin-bottom:18px; border:1px solid #e0e7ef; font-size:16px;">
-                    <span style="font-size:18px; font-weight:600; color:#f5a623; vertical-align:middle; margin-right:8px;">&#128712;</span>
-                    <span style="font-weight:600; color:#222;">I couldn't find any results for your query.</span><br><br>
-                    <span style="color:#222;">I searched with the following:</span><br>
-                    <ul style="margin:8px 0 8px 18px;">
-                ''' +
-                    ''.join([f'<li><b>{i}. {filter_item["value"]}</b> in column <b>{filter_item["column"]}</b></li>' for
-                             i, filter_item in enumerate(filter_info.get("filters", []), 1)]) +
-                    f'<li>Table used: <b>{filter_info.get("table", "Unknown")}</b></li>' +
-                    '''</ul>
-                    <div style="margin-top:10px; color:#333;">
-                        Please clarify what each value represents. For example:<br>
-                        <span style="color:#666; font-size:15px;">
-                        &bull; "it is a project ID"<br>
-                        &bull; "it is a vendor name"<br>
-                        &bull; "it is a person's name"<br>
-                        </span>
+            # Display the clarification UI
+            st.markdown(
+                '''<div style="background-color:#f8fafc; border-radius:10px; padding:18px 20px 14px 20px; margin-bottom:18px; border:1px solid #e0e7ef; font-size:16px;">
+                <span style="font-size:18px; font-weight:600; color:#f5a623; vertical-align:middle; margin-right:8px;">&#128712;</span>
+                <span style="font-weight:600; color:#222;">I couldn't find any results for your query.</span><br><br>
+                <span style="color:#222;">I searched with the following:</span><br>
+                <ul style="margin:8px 0 8px 18px;">
+            ''' +
+                ''.join([f'<li><b>{i}. {filter_item["value"]}</b> in column <b>{filter_item["column"]}</b></li>' for
+                         i, filter_item in enumerate(filter_info.get("filters", []), 1)]) +
+                f'<li>Table used: <b>{filter_info.get("table", "Unknown")}</b></li>' +
+                '''</ul>
+                <div style="margin-top:10px; color:#333;">
+                    Please clarify what each value represents. For example:<br>
+                    <span style="color:#666; font-size:15px;">
+                    &bull; "it is a project ID"<br>
+                    &bull; "it is a vendor name"<br>
+                    &bull; "it is a person's name"<br>
+                    </span>
+                    <br>
+                    <div style="background-color:#e3f2fd; padding:10px; border-radius:5px; margin-top:10px;">
+                        <b>Note:</b> Leave the text box empty and click Submit if the column I used is correct and the result is genuinely empty/zero.
                     </div>
-                    </div>''', unsafe_allow_html=True)
+                </div>
+                </div>''', unsafe_allow_html=True)
 
-                with st.form(key="simple_correction_form"):
-                    clarifications = {}
+            with st.form(key="simple_correction_form"):
+                clarifications = {}
 
-                    # Create input fields for each filter
-                    for i, filter_item in enumerate(filter_info.get("filters", []), 1):
-                        col1, col2 = st.columns([1, 2])
-                        with col1:
-                            st.markdown(f"{i}. **{filter_item['value']}**")
-                        with col2:
-                            clarification = st.text_input(
-                                label=f"What is {filter_item['value']}?",
-                                key=f"simple_clarification_{i}",
-                                placeholder="e.g., it is a person's name",
-                                label_visibility="collapsed"
-                            )
-                            if clarification:
-                                clarifications[f"{filter_item['column']}:{filter_item['value']}"] = clarification
+                # Create input fields for each filter
+                for i, filter_item in enumerate(filter_info.get("filters", []), 1):
+                    col1, col2 = st.columns([1, 2])
+                    with col1:
+                        st.markdown(f"{i}. **{filter_item['value']}**")
+                    with col2:
+                        clarification = st.text_input(
+                            label=f"What is {filter_item['value']}?",
+                            key=f"simple_clarification_{i}",
+                            placeholder="Leave empty if column is correct",
+                            label_visibility="collapsed"
+                        )
+                        if clarification:  # Only add if not empty
+                            clarifications[f"{filter_item['column']}:{filter_item['value']}"] = clarification
 
-                    submitted = st.form_submit_button("Submit Clarifications", type="primary")
+                submitted = st.form_submit_button("Submit Clarifications", type="primary")
 
-                    if submitted and clarifications:
+                if submitted:
+                    # Check if user left everything empty (meaning columns are correct)
+                    if not clarifications:
+                        # User confirmed the columns are correct - just show the original result
+                        # Get the original SQL result that was 0/NULL
+                        original_sql = st.session_state.simple_clarification_data.get("original_sql", "")
+
+                        # Clear clarification state
+                        st.session_state.awaiting_simple_clarification = False
+                        st.session_state.simple_clarification_data = {}
+
+                        # Add a message confirming the result
+                        confirmation_msg = "I understand. The query was correct, and the result is genuinely empty/zero. This means there are no matching records for your search criteria."
+                        st.session_state.messages.append({"role": "assistant", "content": confirmation_msg})
+                        st.session_state.chat_history.append({"role": "assistant", "content": confirmation_msg})
+
+                        save_after_exchange()
+                        st.rerun()
+
+                    else:
+                        # User provided clarifications - proceed with the existing logic
                         # Process and save clarifications
                         engine = get_snowflake_connection()
                         saved = process_simple_clarification(clarifications, engine, st.session_state["user"])
@@ -1658,17 +1681,17 @@ def main_app():
                             # Store the original prompt to retry with new instructions
                             original_prompt = st.session_state.simple_clarification_data.get("original_prompt", "")
 
-                            # Clear clarification state FIRST
+                            # Clear clarification state
                             st.session_state.awaiting_simple_clarification = False
                             st.session_state.simple_clarification_data = {}
-
-                            # Set the retry flag
-                            st.session_state.pending_retry_prompt = original_prompt
 
                             # Add a message to chat history
                             clarification_msg = "I've saved your clarifications. Let me try your question again with this new information..."
                             st.session_state.messages.append({"role": "assistant", "content": clarification_msg})
                             st.session_state.chat_history.append({"role": "assistant", "content": clarification_msg})
+
+                            # Set a flag to automatically retry the question
+                            st.session_state.pending_retry_prompt = original_prompt
 
                             save_after_exchange()
                             st.rerun()
