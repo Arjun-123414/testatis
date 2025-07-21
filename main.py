@@ -23,12 +23,6 @@ from cryptography.hazmat.primitives import serialization
 from syn import correct_user_question_enhanced
 from continuation_detection import check_and_handle_continuation
 from sql_query_fixer import fix_generated_sql
-from query_error_recovery import (
-    handle_ui_based_error_recovery,
-    process_ui_corrections
-)
-from clarification_memory import ClarificationMemory, extract_entities_from_question
-
 # ------------------------
 # Constants for Autosave
 # ------------------------
@@ -291,11 +285,9 @@ def login_page():
 
         # Form elements with placeholder text and icons for intuitive UI
         st.markdown("<div class='custom-label'>Email</div>", unsafe_allow_html=True)
-        email = st.text_input("Email", placeholder="✉️ Enter your email", key="login_email",
-                              label_visibility="collapsed")
+        email = st.text_input("Email", placeholder="✉️ Enter your email", key="login_email", label_visibility="collapsed")
         st.markdown("<div class='custom-label'>Password</div>", unsafe_allow_html=True)
-        password = st.text_input("Password", type="password", placeholder="🔒 Enter your password", key="login_password",
-                                 label_visibility="collapsed")
+        password = st.text_input("Password", type="password", placeholder="🔒 Enter your password", key="login_password", label_visibility="collapsed")
         login_button = st.button("Login", key="login_button", use_container_width=True)
 
         # Placeholder for loading messages
@@ -441,8 +433,7 @@ def password_change_page():
         current_password = st.text_input("Current Password", type="password", placeholder="🔒 Current Password",
                                          key="current_pwd", label_visibility="collapsed")
         st.markdown("<div class='custom-label'>New Password</div>", unsafe_allow_html=True)
-        new_password = st.text_input("New Password", type="password", placeholder="🔒 New Password", key="new_pwd",
-                                     label_visibility="collapsed")
+        new_password = st.text_input("New Password", type="password", placeholder="🔒 New Password", key="new_pwd", label_visibility="collapsed")
         st.markdown("<div class='custom-label'>Confirm New Password</div>", unsafe_allow_html=True)
         confirm_password = st.text_input("Confirm New Password", type="password", placeholder="🔒 Confirm New Password",
                                          key="confirm_pwd", label_visibility="collapsed")
@@ -726,9 +717,145 @@ def save_query_result(user_query, natural_language_response, result, sql_query, 
         db_session.close()
 
 
-# ---------------------------------------------
-# 8. Main Application
-# ---------------------------------------------
+from typing import List, Dict
+import re
+
+
+def save_clarification_as_instruction(engine, user_email, clarification_text):
+    """
+    Save user clarification as an instruction in INSTRUCTIONS_NEW table
+    """
+    from sqlalchemy import text
+    import uuid
+
+    # Generate a UUID for the ID column
+    instruction_id = str(uuid.uuid4())
+
+    insert_sql = """
+    INSERT INTO ATI_AI_USAGE.INSTRUCTIONS_NEW ("ID", "INSTRUCTION", "USERNAME", "DELETED")
+    VALUES (:id, :instruction, :username, FALSE)
+    """
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(insert_sql), {
+                "id": instruction_id,
+                "instruction": clarification_text,
+                "username": user_email
+            })
+            conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error saving instruction: {e}")
+        return False
+
+
+def handle_simple_error_recovery(
+        sql_query: str,
+        result: any,
+        schema_text: str,
+        user_email: str
+) -> Dict:
+    """
+    Simple error recovery that saves to instructions table
+    """
+    # Check if we need error recovery
+    needs_recovery = False
+
+    if isinstance(result, dict) and "error" in result:
+        needs_recovery = True
+    elif isinstance(result, list) and len(result) == 0:
+        needs_recovery = True
+    elif isinstance(result, list) and len(result) == 1:
+        row = result[0]
+        if all(value is None for value in row.values()):
+            needs_recovery = True
+
+    if not needs_recovery:
+        return {"needs_clarification": False}
+
+    # Extract filters from SQL
+    filter_info = extract_all_filters_from_sql(sql_query)
+
+    if not filter_info["filters"]:
+        return {"needs_clarification": False}
+
+    return {
+        "needs_clarification": True,
+        "filter_info": filter_info,
+        "original_sql": sql_query
+    }
+
+
+def extract_all_filters_from_sql(sql_query: str) -> Dict[str, List[Dict]]:
+    """
+    Extract filter conditions from SQL query
+    """
+    # Extract table name
+    table_match = re.search(r'FROM\s+(\w+)', sql_query, re.IGNORECASE)
+    table_name = table_match.group(1) if table_match else "Unknown"
+
+    # Extract WHERE clause
+    where_match = re.search(r'WHERE\s+(.*?)(?:GROUP\s+BY|ORDER\s+BY|LIMIT|$)', sql_query, re.IGNORECASE | re.DOTALL)
+    if not where_match:
+        return {"table": table_name, "filters": []}
+
+    where_clause = where_match.group(1)
+    filters = []
+
+    # Patterns to match different types of conditions
+    patterns = [
+        (r"(\w+)\s+(ILIKE|LIKE)\s*'%?([^%']+)%?'", "string"),
+        (r"(\w+)\s+(ILIKE|LIKE)\s*\"%?([^%\"]+)%?\"", "string"),
+        (r"(\w+)\s*=\s*'([^']+)'", "string"),
+        (r"(\w+)\s*=\s*\"([^\"]+)\"", "string"),
+        (r"(\w+)\s*(=|!=|<>|<=|>=|<|>)\s*(\d+(?:\.\d+)?)", "numeric"),
+    ]
+
+    for pattern, filter_type in patterns:
+        for match in re.finditer(pattern, where_clause, re.IGNORECASE):
+            if len(match.groups()) == 3:
+                column, operator, value = match.groups()
+            else:
+                column, value = match.groups()
+                operator = "="
+
+            filters.append({
+                "column": column,
+                "operator": operator,
+                "value": value.strip("'\""),
+                "type": filter_type
+            })
+
+    return {
+        "table": table_name,
+        "filters": filters
+    }
+
+
+def process_simple_clarification(clarifications: Dict[str, str], engine, user_email: str) -> List[str]:
+    """
+    Process clarifications and save them as instructions
+    """
+    saved_instructions = []
+
+    for key, description in clarifications.items():
+        if key == "table":
+            instruction = f"Use table {description} when appropriate"
+        else:
+            # Extract value from key (format: "column:value")
+            if ":" in key:
+                _, value = key.split(":", 1)
+                instruction = f"{value}: {description}"
+            else:
+                instruction = f"{key}: {description}"
+
+        # Save to instructions table
+        if save_clarification_as_instruction(engine, user_email, instruction):
+            saved_instructions.append(instruction)
+
+    return saved_instructions
+
 def main_app():
     if "user" in st.session_state:
         # username = st.session_state["user"].split("@")[0]
@@ -962,7 +1089,6 @@ def main_app():
             enhanced_prompt = base_prompt + instruction_section
 
         return enhanced_prompt
-
     def get_cached_schema_details(user_email):
         """Get schema details from cache or database"""
         cache_key = f"schema_{user_email}"
@@ -981,6 +1107,12 @@ def main_app():
 
         return schema_details
 
+    if "awaiting_simple_clarification" not in st.session_state:
+        st.session_state.awaiting_simple_clarification = False
+    if "simple_clarification_data" not in st.session_state:
+        st.session_state.simple_clarification_data = {}
+    if "pending_retry_prompt" not in st.session_state:
+        st.session_state.pending_retry_prompt = None
     if "last_sql_query" not in st.session_state:
         st.session_state.last_sql_query = None
     if "awaiting_continuation_choice" not in st.session_state:
@@ -1034,7 +1166,7 @@ def main_app():
                 if date not in conversations_by_date:
                     conversations_by_date[date] = []
                 conversations_by_date[date].append(conv)
-            import datetime
+
             # Display conversations grouped by date
             for date, convs in conversations_by_date.items():
                 # Format date for display (e.g., "15-3-25" instead of "2025-03-15")
@@ -1086,7 +1218,12 @@ def main_app():
             delete_chat_by_id(st.session_state.current_chat_id)
             st.success("Chat history cleared!")
             st.rerun()
-
+        # Add this in sidebar after the Learning Stats button
+        if "knowledge_base_instructions" in st.session_state and st.session_state.knowledge_base_instructions:
+            with st.expander("📚 Knowledge Base"):
+                st.markdown("*Shared instructions from all users:*")
+                for i, instruction in enumerate(st.session_state.knowledge_base_instructions, 1):
+                    st.markdown(f"{i}. {instruction}")
         # 4. Logout button
         if st.button("Logout"):
             # Clear all session state variables related to chat and queries
@@ -1095,21 +1232,6 @@ def main_app():
             # Reinitialize only the authentication state
             st.session_state["authenticated"] = False
             st.rerun()
-        if st.button("📊 Learning Stats"):
-            memory = ClarificationMemory(get_snowflake_connection())
-            stats = memory.get_clarification_stats(st.session_state["user"])
-            if not stats.empty:
-                st.markdown("### 🧠 What I've Learned")
-                st.dataframe(stats)
-            else:
-                st.info("No clarifications learned yet")
-
-            # Add admin function to clean old clarifications (optional)
-        if st.session_state["user"].endswith("@admin.ahs.com"):  # Admin check
-            if st.button("🧹 Clean Old Clarifications"):
-                memory = ClarificationMemory(get_snowflake_connection())
-                memory.cleanup_old_clarifications(12)  # Clean > 12 months old
-                st.success("Cleaned old clarifications")
 
     # ----------------------------------
     #  B) MAIN: Chat interface
@@ -1215,16 +1337,6 @@ def main_app():
         # Create chat_message_columns map to track which messages have tables
     if "chat_message_tables" not in st.session_state:
         st.session_state.chat_message_tables = {}
-    if "awaiting_error_clarification" not in st.session_state:
-        st.session_state.awaiting_error_clarification = False
-    if "error_clarification_data" not in st.session_state:
-        st.session_state.error_clarification_data = {}
-    if "ui_corrections" not in st.session_state:
-        st.session_state.ui_corrections = {}
-    if "awaiting_correction_submit" not in st.session_state:
-        st.session_state.awaiting_correction_submit = False
-    if "pending_corrected_sql" not in st.session_state:
-        st.session_state.pending_corrected_sql = None
 
         # Initialize messages without system prompt
     if not st.session_state.messages:
@@ -1242,52 +1354,6 @@ def main_app():
         return get_groq_response(full_messages)
 
         # Function to handle table display based on row count
-
-    def get_groq_response_with_clarifications(conversation_messages, user_email, current_question, schema_text):
-        """
-        Enhanced version that checks for previous clarifications before generating SQL.
-        """
-        # Initialize clarification memory
-        memory = ClarificationMemory(get_snowflake_connection())
-
-        # Extract entities from the current question
-        entities = extract_entities_from_question(current_question, schema_text)
-
-        # Get relevant clarifications
-        clarifications = memory.get_relevant_clarifications(user_email, current_question, entities)
-
-        # If we have clarifications, enhance the system prompt
-        if clarifications:
-            # Create enhanced messages with clarification context
-            enhanced_messages = conversation_messages.copy()
-
-            # Find the user message and enhance it
-            for i, msg in enumerate(enhanced_messages):
-                if msg["role"] == "user" and current_question in msg["content"]:
-                    enhanced_prompt, clarification_context = memory.apply_clarifications_to_prompt(
-                        msg["content"], clarifications
-                    )
-                    enhanced_messages[i] = {"role": "user", "content": enhanced_prompt}
-
-                    # Show what clarifications were applied
-                    applied_items = []
-                    for entity, info in clarifications.items():
-                        if info["type"] == "column_mapping":
-                            applied_items.append(f"'{entity}' → {info['value']}")
-
-                    if applied_items:
-                        st.info(f"📚 Applied learned clarifications: {', '.join(applied_items)}")
-                    break
-
-            # Call the original function with enhanced messages
-            return get_groq_response(
-                [{"role": "system", "content": st.session_state.system_prompt}] + enhanced_messages
-            )
-        else:
-            # No clarifications found, proceed normally
-            return get_groq_response(
-                [{"role": "system", "content": st.session_state.system_prompt}] + conversation_messages
-            )
 
     def display_table_with_size_handling(df, message_index, df_idx):
         """
@@ -1355,401 +1421,6 @@ def main_app():
 
         if msg["role"] == "assistant":
             message_index += 1
-            # (REMOVE the clarification UI block from here)
-            # (REMOVE the pending_corrected_sql execution block from here)
-
-    # ---- END chat history rendering loop ----
-
-    # Display correction UI if waiting for clarification (moved outside loop)
-    if st.session_state.awaiting_error_clarification and "error_clarification_data" in st.session_state:
-        # Create a unique container for the correction UI
-        correction_container = st.container()
-        with correction_container:
-            with st.chat_message("assistant"):
-                filter_info = st.session_state.error_clarification_data.get("filter_info", {})
-                # --- CLEANER INSTRUCTION BLOCK ---
-                st.markdown(
-                    '''<div style="background-color:#f8fafc; border-radius:10px; padding:18px 20px 14px 20px; margin-bottom:18px; border:1px solid #e0e7ef; font-size:16px;">
-                    <span style="font-size:18px; font-weight:600; color:#f5a623; vertical-align:middle; margin-right:8px;">&#128712;</span>
-                    <span style="font-weight:600; color:#222;">I couldn't find any results for your query.</span><br><br>
-                    <span style="color:#222;">I searched with the following:</span><br>
-                    <ul style="margin:8px 0 8px 18px;">
-                ''' +
-                    ''.join([f'<li><b>{i}. {filter_item["value"]}</b> in column <b>{filter_item["column"]}</b></li>' for
-                             i, filter_item in enumerate(filter_info.get("filters", []), 1)]) +
-                    f'<li>Table used: <b>{filter_info.get("table", "Unknown")}</b></li>' +
-                    '''</ul>
-                    <div style="margin-top:10px; color:#333;">
-                        To help me find the correct data, please tell me what each value represents. For example:<br>
-                        <span style="color:#666; font-size:15px;">
-                        &bull; "2500148150 is a project ID"<br>
-                        &bull; "Elite Disaster Team is a vendor name"<br>
-                        &bull; "Use AP_DETAILS table instead"<br>
-                        </span>
-                        <br>Or type <b>"correct"</b> if everything looks right.
-                    </div>
-                    </div>''', unsafe_allow_html=True)
-                # --- END CLEANER INSTRUCTION BLOCK ---
-                with st.form(key="correction_form"):
-                    corrections = {}
-                    for i, filter_item in enumerate(filter_info.get("filters", []), 1):
-                        col1, col2 = st.columns([1, 2])
-                        with col1:
-                            st.markdown(f"{i}. **{filter_item['value']}**")
-                        with col2:
-                            correction = st.text_input(
-                                label=f"Correction for {filter_item['value']}",
-                                key=f"correction_filter_{i}",
-                                placeholder="Leave empty if correct",
-                                label_visibility="collapsed"
-                            )
-                            if correction:
-                                corrections[f"{filter_item['column']}:{filter_item['value']}"] = correction
-                    col1, col2 = st.columns([1, 2])
-                    with col1:
-                        st.markdown(
-                            f"**{len(filter_info.get('filters', [])) + 1}. {filter_info.get('table', 'Unknown')}**")
-                    with col2:
-                        table_correction = st.text_input(
-                            label="Table correction",
-                            key="correction_table",
-                            placeholder="Leave empty if correct",
-                            label_visibility="collapsed"
-                        )
-                        if table_correction:
-                            corrections["table"] = table_correction
-                    st.markdown(
-                        "**NOTE:** Leave the box empty for the corresponding thing if you feel everything is correct with that particular case")
-                    submitted = st.form_submit_button("Submit Corrections", type="primary")
-                    if submitted:
-                        recovery_result = process_ui_corrections(
-                            corrections,
-                            filter_info,
-                            st.session_state.error_clarification_data["original_sql"],
-                            schema_text,
-                            get_groq_response_with_system,
-                            snowflake_engine=get_snowflake_connection(),  # ADD THIS
-                            user_email=st.session_state["user"],  # ADD THIS
-                            original_question=st.session_state.error_clarification_data["original_prompt"]  # ADD THIS
-                        )
-                        st.session_state.awaiting_error_clarification = False
-                        if recovery_result.get("needs_retry") and recovery_result.get("fixed_sql"):
-                            st.session_state.pending_corrected_sql = {
-                                "sql": recovery_result["fixed_sql"],
-                                "original_prompt": st.session_state.error_clarification_data["original_prompt"],
-                                "corrections": recovery_result.get("corrections_applied", {})
-                            }
-                        save_after_exchange()
-                        st.rerun()
-
-    def clean_llm_response(response: str) -> str:
-
-        """
-        Cleans up LLM responses for consistent display:
-        - Removes markdown formatting like *, _, `
-        - Fixes spacing after commas
-        - Normalizes multiple spaces
-        """
-        cleaned = re.sub(r'[*_`]', '', response)
-        cleaned = re.sub(r',(?=\S)', ', ', cleaned)
-        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
-        return cleaned.strip()
-
-    def extract_ranking_criteria(sql_query: str) -> str:
-        """
-        Analyze SQL query to determine the ranking/sorting criteria
-        Returns a human-readable description of the criteria
-        """
-        sql_upper = sql_query.upper()
-
-        # Check ORDER BY clause
-        order_by_match = re.search(r'ORDER\s+BY\s+([^;]+?)(?:DESC|ASC|LIMIT|$)', sql_upper, re.IGNORECASE)
-
-        if order_by_match:
-            order_clause = order_by_match.group(1).strip()
-
-            # Common patterns
-            if 'COUNT(' in order_clause:
-                if 'DISTINCT' in order_clause:
-                    # Extract what's being counted
-                    count_match = re.search(r'COUNT\s*\(\s*DISTINCT\s+(\w+)', order_clause)
-                    if count_match:
-                        column = count_match.group(1).lower()
-                        return f"based on the count of unique {column.replace('_', ' ')}s"
-                else:
-                    return "based on the total count"
-
-            elif 'SUM(' in order_clause:
-                sum_match = re.search(r'SUM\s*\(\s*(\w+)', order_clause)
-                if sum_match:
-                    column = sum_match.group(1).lower()
-                    return f"based on the total {column.replace('_', ' ')}"
-
-            elif 'MAX(' in order_clause:
-                return "based on the maximum value"
-
-            elif 'MIN(' in order_clause:
-                return "based on the minimum value"
-
-            elif 'AVG(' in order_clause:
-                return "based on the average"
-
-        # Check if there's a LIMIT without clear ordering (implies some kind of top/max query)
-        if 'LIMIT' in sql_upper and 'GROUP BY' in sql_upper:
-            return "based on the grouping and aggregation used"
-
-        return ""
-
-    def format_llm_response(text: str) -> str:
-        """
-        Formats LLM responses into clean HTML using preferred font and bold keys.
-        Handles all 'Key: Value' lines dynamically.
-        """
-        import html
-
-        lines = text.strip().split('\n')
-        formatted_lines = []
-
-        for line in lines:
-            if ':' in line:
-                key, value = line.split(':', 1)
-                formatted_lines.append(
-                    f"<div><strong>{html.escape(key.strip())}:</strong> {html.escape(value.strip())}</div>")
-            else:
-                formatted_lines.append(f"<div>{html.escape(line.strip())}</div>")
-
-        html_output = f"""
-        <div style="font-family: Arial, sans-serif; font-size: 16px; color: #333; line-height: 1.6; padding: 8px 0;">
-            {''.join(formatted_lines)}
-        </div>
-        """
-        return html_output
-
-    st.markdown("""
-        <style>
-        @keyframes pulse {
-            0% {
-                transform: scale(1);
-                opacity: 1;
-            }
-            50% {
-                transform: scale(1.05);
-                opacity: 0.7;
-            }
-            100% {
-                transform: scale(1);
-                opacity: 1;
-            }
-        }
-
-        .thinking-animation {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            animation: pulse 2s ease-in-out infinite;
-            font-size: 18px;
-            font-weight: 600;
-            margin: 20px 0;
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
-        }
-
-        .processing-dots {
-            display: inline-block;
-            width: 80px;
-            text-align: left;
-        }
-
-        .processing-dots::after {
-            content: '';
-            animation: dots 1.5s steps(4, end) infinite;
-        }
-
-        @keyframes dots {
-            0% { content: ''; }
-            25% { content: '.'; }
-            50% { content: '..'; }
-            75% { content: '...'; }
-            100% { content: ''; }
-        }
-
-        .thinking-icon {
-            display: inline-block;
-            animation: spin 2s linear infinite;
-            margin-right: 10px;
-        }
-
-        @keyframes spin {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
-        }
-        </style>
-        """, unsafe_allow_html=True)
-    # Execute pending corrected query if exists (also moved outside loop)
-    if "pending_corrected_sql" in st.session_state and st.session_state.pending_corrected_sql:
-        pending = st.session_state.pending_corrected_sql
-        st.session_state.pending_corrected_sql = None
-        with st.spinner("Executing corrected query..."):
-            try:
-                fixed_sql = pending["sql"]
-                original_prompt = pending["original_prompt"]
-                result = query_snowflake(fixed_sql, st.session_state["user"])
-                response_text = None  # No LLM SQL generation here, but keep for logging
-                token_usage_first_call = 0
-                # --- BEGIN: Use regular answer mechanism for result rendering ---
-                import datetime
-                result_to_save = result
-                if isinstance(result, list) and len(result) > 100:
-                    result_to_save = result[:100]
-                if isinstance(result, dict) and "error" in result:
-                    natural_response = result["error"]
-                elif isinstance(result, list):
-                    processed_result = []
-                    has_datetime = False
-                    if result and isinstance(result[0], dict):
-                        for value in result[0].values():
-                            if isinstance(value, (datetime.date, datetime.datetime)):
-                                has_datetime = True
-                                break
-                    if has_datetime:
-                        for item in result:
-                            processed_item = {}
-                            for key, value in item.items():
-                                if isinstance(value, (datetime.date, datetime.datetime)):
-                                    processed_item[key] = value.strftime('%Y-%m-%d')
-                                else:
-                                    processed_item[key] = value
-                            processed_result.append(processed_item)
-                        df = pd.DataFrame(processed_result)
-                    else:
-                        df = pd.DataFrame(result)
-                    df = df.drop_duplicates()
-                    num_rows = len(df)
-                    has_null_content = False
-                    if num_rows == 1:
-                        if df.shape[1] == 1 and df.iloc[0, 0] is None:
-                            has_null_content = True
-                        elif isinstance(result, list) and len(result) == 1:
-                            row = result[0]
-                            if all(value is None for value in row.values()):
-                                has_null_content = True
-                    should_create_table = num_rows > 1 or (num_rows == 1 and df.shape[1] > 8)
-                    if should_create_table:
-                        df_idx = len(st.session_state.persistent_dfs)
-                        st.session_state.persistent_dfs.append(df)
-                        current_message_idx = len(
-                            [m for m in st.session_state.chat_history if m["role"] == "assistant"]
-                        )
-                        st.session_state.chat_message_tables[current_message_idx] = df_idx
-                        if num_rows > 200000:
-                            natural_response = f"Query returned {num_rows:,} rows. Due to the large size of the result, only a download option is provided below. You can download the full dataset as a CSV file for viewing in your preferred spreadsheet application."
-                        elif num_rows > 1:
-                            natural_response = f"Query returned {num_rows:,} rows. The result is displayed below:"
-                        else:
-                            natural_response = "Here are the complete details in a structured format:"
-                        token_usage_second_call = 0
-                    elif num_rows == 0 or has_null_content:
-                        natural_response = (
-                            "No results found for the query.\n"
-                            "- Double-check the spelling of table names, column names, and values.\n"
-                            "- Verify that the data you're searching for exists in the database.\n"
-                            "- Check for any case sensitivity issues."
-                        )
-                    else:
-                        result_for_messages = result
-                        # Use LLM for natural language response
-                        ranking_criteria = ""
-                        if any(keyword in original_prompt.lower() for keyword in
-                               ['top', 'highest', 'most', 'maximum', 'best', 'largest', 'least', 'lowest', 'minimum']):
-                            ranking_criteria = extract_ranking_criteria(fixed_sql)
-                        instructions = {
-                            "role": "user",
-                            "content": f"""      
-                                    User Question: {original_prompt}        
-                                    Database Query Result: {result_for_messages}
-                                    SQL Query Used: {fixed_sql}
-                                    {f"Ranking Criteria: {ranking_criteria}" if ranking_criteria else ""}
-
-                                    Instructions:       
-                                    1. Directly use the database query result to answer the user's question.
-
-                                    2. For ranking/top/maximum queries:
-                                       - Always mention the criteria used for ranking
-                                       - Use the \"Ranking Criteria\" provided above if available
-                                       - Include the metric value if available in the result
-
-                                    3. Format guidelines:
-                                       - Use bullet points for better readability when there are many details
-                                       - Bold important values like names, amounts, and dates
-                                       - Keep monetary values properly formatted with commas
-
-                                    4. Do not include raw SQL or JSON in the response
-
-                                    5. Use chat history for context in follow-up questions
-
-                                    Examples:
-                                    - \"Top vendor by purchase orders\" → \"The top vendor is X with Y purchase orders\"
-                                    - \"Highest spending project\" → \"Project X has the highest spending of $Y\"
-                                    - \"Most active department\" → \"Department X is most active based on transaction count\"
-                                    """
-                        }
-                        temp_messages = st.session_state.messages + [instructions]
-                        natural_response, token_usage_second_call = get_groq_response_with_system(temp_messages)
-                        st.session_state.total_tokens += token_usage_second_call
-                        natural_response = clean_llm_response(natural_response)
-                    # ----- Save Results & Display -----
-                    save_query_result(
-                        original_prompt,
-                        natural_response,
-                        result_to_save,
-                        fixed_sql,
-                        None,  # No LLM SQL generation here
-                        tokens_first_call=0,
-                        tokens_second_call=locals().get("token_usage_second_call", 0),
-                        total_tokens_used=st.session_state.total_tokens
-                    )
-
-                    # Show final answer in the response container
-                    st.session_state.messages.append({"role": "assistant", "content": natural_response})
-                    st.session_state.chat_history.append({"role": "assistant", "content": natural_response})
-                    save_after_exchange()
-                    with st.chat_message("assistant"):
-                        formatted_html = format_llm_response(natural_response)
-                        st.markdown(formatted_html, unsafe_allow_html=True)
-                        current_message_idx = len(
-                            [m for m in st.session_state.chat_history if m["role"] == "assistant"]
-                        ) - 1
-                        if current_message_idx in st.session_state.chat_message_tables:
-                            df_idx = st.session_state.chat_message_tables[current_message_idx]
-                            if df_idx < len(st.session_state.persistent_dfs):
-                                df = st.session_state.persistent_dfs[df_idx]
-                                if not df.empty:
-                                    display_table_with_size_handling(df, current_message_idx, df_idx)
-                else:
-                    natural_response = "No valid result returned."
-
-                    # Save to query log
-                    save_query_result(
-                        original_prompt,
-                        natural_response,
-                        None,
-                        fixed_sql,
-                        None,
-                        tokens_first_call=0,
-                        tokens_second_call=0,
-                        total_tokens_used=st.session_state.total_tokens,
-                        error_message="No valid result returned"
-                    )
-
-                    st.session_state.messages.append({"role": "assistant", "content": natural_response})
-                    st.session_state.chat_history.append({"role": "assistant", "content": natural_response})
-                    save_after_exchange()
-                    with st.chat_message("assistant"):
-                        st.markdown(natural_response)
-                # --- END: Use regular answer mechanism for result rendering ---
-            except Exception as e:
-                st.error(f"Error executing corrected query: {e}")
 
     def animated_progress_bar(container, message, progress_time=1.5):
         """Display an animated progress bar with a message."""
@@ -1828,7 +1499,6 @@ def main_app():
             return "based on the grouping and aggregation used"
 
         return ""
-
     def format_llm_response(text: str) -> str:
         """
         Formats LLM responses into clean HTML using preferred font and bold keys.
@@ -1916,18 +1586,394 @@ def main_app():
         </style>
         """, unsafe_allow_html=True)
 
-    # Replace the chat input section with this enhanced version:
+    if st.session_state.awaiting_simple_clarification and "simple_clarification_data" in st.session_state:
+        with st.container():
+            with st.chat_message("assistant"):
+                filter_info = st.session_state.simple_clarification_data.get("filter_info", {})
+
+                # Display the clarification UI
+                st.markdown(
+                    '''<div style="background-color:#f8fafc; border-radius:10px; padding:18px 20px 14px 20px; margin-bottom:18px; border:1px solid #e0e7ef; font-size:16px;">
+                    <span style="font-size:18px; font-weight:600; color:#f5a623; vertical-align:middle; margin-right:8px;">&#128712;</span>
+                    <span style="font-weight:600; color:#222;">I couldn't find any results for your query.</span><br><br>
+                    <span style="color:#222;">I searched with the following:</span><br>
+                    <ul style="margin:8px 0 8px 18px;">
+                ''' +
+                    ''.join([f'<li><b>{i}. {filter_item["value"]}</b> in column <b>{filter_item["column"]}</b></li>' for
+                             i, filter_item in enumerate(filter_info.get("filters", []), 1)]) +
+                    f'<li>Table used: <b>{filter_info.get("table", "Unknown")}</b></li>' +
+                    '''</ul>
+                    <div style="margin-top:10px; color:#333;">
+                        Please clarify what each value represents. For example:<br>
+                        <span style="color:#666; font-size:15px;">
+                        &bull; "it is a project ID"<br>
+                        &bull; "it is a vendor name"<br>
+                        &bull; "it is a person's name"<br>
+                        </span>
+                    </div>
+                    </div>''', unsafe_allow_html=True)
+
+                with st.form(key="simple_correction_form"):
+                    clarifications = {}
+
+                    # Create input fields for each filter
+                    for i, filter_item in enumerate(filter_info.get("filters", []), 1):
+                        col1, col2 = st.columns([1, 2])
+                        with col1:
+                            st.markdown(f"{i}. **{filter_item['value']}**")
+                        with col2:
+                            clarification = st.text_input(
+                                label=f"What is {filter_item['value']}?",
+                                key=f"simple_clarification_{i}",
+                                placeholder="e.g., it is a person's name",
+                                label_visibility="collapsed"
+                            )
+                            if clarification:
+                                clarifications[f"{filter_item['column']}:{filter_item['value']}"] = clarification
+
+                    submitted = st.form_submit_button("Submit Clarifications", type="primary")
+
+                    if submitted and clarifications:
+                        # Process and save clarifications
+                        engine = get_snowflake_connection()
+                        saved = process_simple_clarification(clarifications, engine, st.session_state["user"])
+
+                        if saved:
+                            st.success(f"Saved {len(saved)} clarification(s) for future use!")
+
+                            # Reload instructions to include new ones
+                            all_instructions = load_all_instructions(engine)
+                            st.session_state.knowledge_base_instructions = all_instructions
+
+                            # Update system prompt with new instructions
+                            enhanced_template = enhance_system_prompt_with_instructions(
+                                fetch_system_prompt_sections(),
+                                all_instructions
+                            )
+                            st.session_state.system_prompt = enhanced_template.format(
+                                schema_text=schema_text,
+                                user_email=st.session_state["user"]
+                            )
+
+                            # Store the original prompt to retry with new instructions
+                            original_prompt = st.session_state.simple_clarification_data.get("original_prompt", "")
+
+                            # Clear clarification state FIRST
+                            st.session_state.awaiting_simple_clarification = False
+                            st.session_state.simple_clarification_data = {}
+
+                            # Set the retry flag
+                            st.session_state.pending_retry_prompt = original_prompt
+
+                            # Add a message to chat history
+                            clarification_msg = "I've saved your clarifications. Let me try your question again with this new information..."
+                            st.session_state.messages.append({"role": "assistant", "content": clarification_msg})
+                            st.session_state.chat_history.append({"role": "assistant", "content": clarification_msg})
+
+                            save_after_exchange()
+                            st.rerun()
+                        else:
+                            st.error("Failed to save clarifications. Please try again.")
+
+    elif st.session_state.pending_retry_prompt:  # Note the 'elif' here - this ensures it doesn't run when showing clarification UI
+        retry_prompt = st.session_state.pending_retry_prompt
+        st.session_state.pending_retry_prompt = None  # Clear it immediately to prevent duplicate execution
+
+        # Show the retried question in chat
+        with st.chat_message("user"):
+            st.markdown(retry_prompt)
+
+        # Add to history
+        st.session_state.messages.append({"role": "user", "content": retry_prompt})
+        st.session_state.chat_history.append({"role": "user", "content": retry_prompt})
+
+        # Now process this prompt with the updated instructions
+        # Create a placeholder for the initial loading animation
+        initial_loading_placeholder = st.empty()
+
+        # Show immediate loading animation
+        with initial_loading_placeholder.container():
+            st.markdown("""
+                <div class="thinking-animation">
+                    <span class="thinking-icon">🤔</span>
+                    Reprocessing with clarifications<span class="processing-dots"></span>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Store the original prompt for display purposes
+        original_prompt = retry_prompt
+        prompt = retry_prompt  # Set prompt variable for processing
+
+        # Apply both contextual and synonym corrections
+        engine = get_snowflake_connection()
+        corrected_prompt, correction_info = correct_user_question_enhanced(
+            retry_prompt,
+            schema_text,
+            engine,
+            get_groq_response,
+            conversation_history=st.session_state.messages
+        )
+
+        # Clear the initial loading animation
+        initial_loading_placeholder.empty()
+
+        # Determine which prompt to use
+        final_prompt = corrected_prompt if correction_info.get('replacements') else original_prompt
+
+        # If corrections were made, show them with more detail
+        if correction_info.get('replacements'):
+            info_text = "**Query Correction Applied:**\n\n"
+            info_text += f"Original: {original_prompt}\n\n"
+            info_text += f"Corrected: {corrected_prompt}\n\n"
+
+            if correction_info.get('contextual_replacements'):
+                info_text += "**Contextual replacements:**\n"
+                for orig, repl in correction_info['contextual_replacements'].items():
+                    info_text += f"- '{orig}' → '{repl}'\n"
+            if correction_info.get('synonym_replacements'):
+                info_text += "\n**Synonym replacements:**\n"
+                for orig, repl in correction_info['synonym_replacements'].items():
+                    info_text += f"- '{orig}' → '{repl}'\n"
+
+            st.info(info_text, icon="ℹ️")
+
+        # Use the corrected prompt for processing
+        prompt = final_prompt
+
+        # Continue with the rest of processing
+        progress_container = st.container()
+        response_container = st.container()
+        final_message_placeholder = st.empty()
+
+        sql_query = None
+        response_text = None
+
+        try:
+            # 1. Analyzing phase
+            animated_progress_bar(
+                progress_container,
+                "🔍 Re-analyzing your query with clarifications...",
+                progress_time=1.0
+            )
+
+            # 2. SQL generation update
+            with progress_container:
+                status_text = st.empty()
+                status_text.markdown(
+                    "<div style='color:#3366ff; font-weight:bold;'>💻 Generating SQL query with new understanding...</div>",
+                    unsafe_allow_html=True
+                )
+
+            response_text, token_usage_first_call = get_groq_response_with_system(
+                st.session_state.messages
+            )
+            st.session_state.total_tokens += token_usage_first_call
+
+            # Check if it's an error response
+            if response_text.strip().startswith("ERROR:"):
+                raise Exception(response_text.strip())
+
+            sql_query = response_text.strip()
+
+            if sql_query.startswith("```sql"):
+                sql_query = sql_query[6:]  # Remove ```sql
+            if sql_query.startswith("```"):
+                sql_query = sql_query[3:]  # Remove ```
+            if sql_query.endswith("```"):
+                sql_query = sql_query[:-3]  # Remove trailing ```
+
+            sql_query = sql_query.strip()
+            original_sql = sql_query
+            sql_query = fix_generated_sql(sql_query, schema_text)
+            st.session_state.last_sql_query = sql_query
+
+            # 3. Executing query animation update
+            with progress_container:
+                status_text.markdown(
+                    "<div style='color:#3366ff; font-weight:bold;'>⚡ Executing corrected query on Snowflake...</div>",
+                    unsafe_allow_html=True
+                )
+
+            result = query_snowflake(sql_query, st.session_state["user"])
+
+            # 4. Processing results
+            with progress_container:
+                status_text.markdown(
+                    "<div style='color:#3366ff; font-weight:bold;'>🔄 Processing results...</div>",
+                    unsafe_allow_html=True
+                )
+
+            result_to_save = result
+            if isinstance(result, list) and len(result) > 100:
+                result_to_save = result[:100]
+
+            if isinstance(result, dict) and "error" in result:
+                natural_response = result["error"]
+            elif isinstance(result, list):
+                processed_result = []
+                has_datetime = False
+                if result and isinstance(result[0], dict):
+                    for value in result[0].values():
+                        if isinstance(value, (datetime.date, datetime.datetime)):
+                            has_datetime = True
+                            break
+
+                if has_datetime:
+                    for item in result:
+                        processed_item = {}
+                        for key, value in item.items():
+                            if isinstance(value, (datetime.date, datetime.datetime)):
+                                processed_item[key] = value.strftime('%Y-%m-%d')
+                            else:
+                                processed_item[key] = value
+                        processed_result.append(processed_item)
+                    df = pd.DataFrame(processed_result)
+                else:
+                    df = pd.DataFrame(result)
+
+                df = df.drop_duplicates()
+                num_rows = len(df)
+                has_null_content = False
+                if num_rows == 1:
+                    if df.shape[1] == 1 and df.iloc[0, 0] is None:
+                        has_null_content = True
+                    elif isinstance(result, list) and len(result) == 1:
+                        row = result[0]
+                        if all(value is None for value in row.values()):
+                            has_null_content = True
+
+                if num_rows > 1:
+                    df_idx = len(st.session_state.persistent_dfs)
+                    st.session_state.persistent_dfs.append(df)
+                    current_message_idx = len(
+                        [m for m in st.session_state.chat_history if m["role"] == "assistant"]
+                    )
+                    st.session_state.chat_message_tables[current_message_idx] = df_idx
+                    if num_rows > 200000:
+                        natural_response = f"Query returned {num_rows:,} rows. Due to the large size of the result, only a download option is provided below. You can download the full dataset as a CSV file for viewing in your preferred spreadsheet application."
+                    else:
+                        natural_response = f"Query returned {num_rows:,} rows. The result is displayed below:"
+
+                    token_usage_second_call = 0
+                elif num_rows == 0 or has_null_content:
+                    # Still no results - shouldn't happen after clarification, but handle gracefully
+                    natural_response = "I still couldn't find results. The clarification has been saved and will be used for future queries."
+                else:
+                    # Single row result - process normally
+                    result_for_messages = result
+                    with progress_container:
+                        if 'status_text' in locals():
+                            status_text.empty()
+                        status_text = st.empty()
+                        status_text.markdown(
+                            "<div style='color:#3366ff; font-weight:bold;'>✍️ Generating human-friendly response...</div>",
+                            unsafe_allow_html=True
+                        )
+                    instructions = {
+                        "role": "user",
+                        "content": f"""      
+                                User Question: {prompt}.        
+                                Database Query Result: {result_for_messages}.        
+                                Instructions:       
+                                1. Directly use the database query result to answer the user's question.       
+                                2. Generate a precise, well-structured response that directly answers the query.      
+                                3. Ensure proper punctuation, spacing, and relevant insights without making assumptions.      
+                                4. Do not include SQL or JSON in the response.      
+                                5. Use chat history for follow-ups; if unclear, infer the last mentioned entity/metric.      
+                                """
+                    }
+                    temp_messages = st.session_state.messages + [instructions]
+                    natural_response, token_usage_second_call = get_groq_response_with_system(temp_messages)
+                    st.session_state.total_tokens += token_usage_second_call
+                    natural_response = clean_llm_response(natural_response)
+                    with progress_container:
+                        status_text.markdown(
+                            "<div style='color:#3366ff; font-weight:bold;'>✨ Formatting results for display...</div>",
+                            unsafe_allow_html=True
+                        )
+                        time.sleep(0.8)
+            else:
+                natural_response = "No valid result returned."
+
+            # Clear everything in the progress container
+            with progress_container:
+                if 'status_text' in locals():
+                    status_text.empty()
+                progress_container.empty()
+
+            final_message_placeholder.markdown(
+                "<div style='color:#3366ff; font-weight:bold;'>🎬 Preparing your answer...</div>",
+                unsafe_allow_html=True
+            )
+
+            save_query_result(
+                prompt,
+                natural_response,
+                result_to_save,
+                sql_query,
+                response_text,
+                tokens_first_call=token_usage_first_call,
+                tokens_second_call=locals().get("token_usage_second_call", None),
+                total_tokens_used=st.session_state.total_tokens
+            )
+
+            st.session_state.messages.append({"role": "assistant", "content": natural_response})
+            st.session_state.chat_history.append({"role": "assistant", "content": natural_response})
+
+            save_after_exchange()
+
+            # Clear the final transition message
+            final_message_placeholder.empty()
+
+            # Show final answer in the response container
+            with response_container:
+                with st.chat_message("assistant"):
+                    formatted_html = format_llm_response(natural_response)
+                    st.markdown(formatted_html, unsafe_allow_html=True)
+                    if st.session_state.last_sql_query:
+                        with st.expander("🔍 View SQL Query", expanded=False):
+                            st.code(st.session_state.last_sql_query, language='sql')
+
+                    current_message_idx = len(
+                        [m for m in st.session_state.chat_history if m["role"] == "assistant"]
+                    ) - 1
+                    if current_message_idx in st.session_state.chat_message_tables:
+                        df_idx = st.session_state.chat_message_tables[current_message_idx]
+                        if df_idx < len(st.session_state.persistent_dfs):
+                            df = st.session_state.persistent_dfs[df_idx]
+                            if not df.empty:
+                                display_table_with_size_handling(df, current_message_idx, df_idx)
+
+        except Exception as e:
+            # If there's an error, clear the progress animation first
+            with progress_container:
+                if 'status_text' in locals():
+                    status_text.empty()
+                progress_container.empty()
+
+            if 'final_message_placeholder' in locals():
+                final_message_placeholder.empty()
+
+            natural_response = f"Error during retry: {str(e)}"
+            save_query_result(
+                prompt,
+                None,
+                None,
+                sql_query if 'sql_query' in locals() else None,
+                response_text if 'response_text' in locals() else str(e),
+                error_message=str(e),
+                tokens_first_call=locals().get("token_usage_first_call", None),
+                total_tokens_used=st.session_state.total_tokens
+            )
+            st.session_state.messages.append({"role": "assistant", "content": natural_response})
+            st.session_state.chat_history.append({"role": "assistant", "content": natural_response})
+            with response_container:
+                with st.chat_message("assistant"):
+                    st.markdown(natural_response)
 
     if prompt := st.chat_input("Type your business question here..."):
         # Create a placeholder for the initial loading animation
         initial_loading_placeholder = st.empty()
-
-        # Check if we're waiting for error clarification
-        # Check if we're waiting for error clarification
-        if st.session_state.awaiting_error_clarification:
-            # Don't process regular chat input when showing correction UI
-            initial_loading_placeholder.empty()
-            st.stop()
 
         # Show immediate loading animation
         with initial_loading_placeholder.container():
@@ -2100,11 +2146,8 @@ def main_app():
                     unsafe_allow_html=True
                 )
 
-            response_text, token_usage_first_call = get_groq_response_with_clarifications(
-                st.session_state.messages,
-                st.session_state["user"],
-                prompt,  # The current question
-                schema_text
+            response_text, token_usage_first_call = get_groq_response_with_system(
+                st.session_state.messages
             )
             st.session_state.total_tokens += token_usage_first_call
 
@@ -2138,35 +2181,52 @@ def main_app():
 
             # Execute the query directly
             result = query_snowflake(sql_query, st.session_state["user"])
-            # 4. Processing results
-            with progress_container:
-                status_text.markdown(
-                    "<div style='color:#3366ff; font-weight:bold;'>🔄 Processing results...</div>",
-                    unsafe_allow_html=True
-                )
-            error_recovery = handle_ui_based_error_recovery(
+            error_recovery = handle_simple_error_recovery(
                 sql_query,
                 result,
-                None,  # No error message at this point
                 schema_text,
-                get_groq_response_with_system,
                 st.session_state["user"]
             )
 
             if error_recovery["needs_clarification"]:
-                # Clear any loading animations
+                # Clear any existing progress animations first
                 with progress_container:
                     if 'status_text' in locals():
                         status_text.empty()
                     progress_container.empty()
 
+                # Clear final message placeholder if exists
                 if 'final_message_placeholder' in locals():
                     final_message_placeholder.empty()
 
-                # Store the error recovery data
-                st.session_state.awaiting_error_clarification = True
-                st.session_state.error_clarification_data = {
-                    "filter_info": error_recovery["filter_info"],  # Changed from problematic_filter
+                # Create a persistent animation placeholder that stays until rerun
+                clarification_animation = st.empty()
+
+                # Show the animation and KEEP IT VISIBLE
+                with clarification_animation.container():
+                    st.markdown("""
+                                    <div class="thinking-animation" style="background: linear-gradient(135deg, #FF6B6B 0%, #FF8E53 100%);">
+                                        <span class="thinking-icon">🔍</span>
+                                        Analyzing query patterns<span class="processing-dots"></span>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+
+                # Brief pause
+                time.sleep(1.5)
+
+                # Update to second message but keep the container
+                with clarification_animation.container():
+                    st.markdown("""
+                                    <div class="thinking-animation" style="background: linear-gradient(135deg, #4ECDC4 0%, #44A08D 100%);">
+                                        <span class="thinking-icon">💡</span>
+                                        I need some clarification to help you better<span class="processing-dots"></span>
+                                    </div>
+                                    """, unsafe_allow_html=True)
+
+                # Store recovery data
+                st.session_state.awaiting_simple_clarification = True
+                st.session_state.simple_clarification_data = {
+                    "filter_info": error_recovery["filter_info"],
                     "original_sql": error_recovery["original_sql"],
                     "original_prompt": prompt
                 }
@@ -2185,7 +2245,19 @@ def main_app():
                 )
 
                 save_after_exchange()
+
+                # Small delay to ensure the animation is visible before rerun
+                time.sleep(0.5)
+
+                # NOW rerun - the animation will stay visible until the page actually refreshes
                 st.rerun()
+
+            # 4. Processing results
+            with progress_container:
+                status_text.markdown(
+                    "<div style='color:#3366ff; font-weight:bold;'>🔄 Processing results...</div>",
+                    unsafe_allow_html=True
+                )
 
                 # ----- Handle Results -----
             result_to_save = result
@@ -2231,9 +2303,7 @@ def main_app():
                         if all(value is None for value in row.values()):
                             has_null_content = True
 
-                should_create_table = num_rows > 1 or (num_rows == 1 and df.shape[1] > 8)
-
-                if should_create_table:
+                if num_rows > 1:
                     df_idx = len(st.session_state.persistent_dfs)
                     st.session_state.persistent_dfs.append(df)
                     current_message_idx = len(
@@ -2241,13 +2311,11 @@ def main_app():
                     )
                     st.session_state.chat_message_tables[current_message_idx] = df_idx
 
-                    # Customize message based on what we're showing
+                    # Customize message based on row count
                     if num_rows > 200000:
                         natural_response = f"Query returned {num_rows:,} rows. Due to the large size of the result, only a download option is provided below. You can download the full dataset as a CSV file for viewing in your preferred spreadsheet application."
-                    elif num_rows > 1:
+                    else:
                         natural_response = f"Query returned {num_rows:,} rows. The result is displayed below:"
-                    else:  # 1 row with many columns
-                        natural_response = "Here are the complete details in a structured format:"
 
                     token_usage_second_call = 0
                 elif num_rows == 0 or has_null_content:
@@ -2285,7 +2353,6 @@ def main_app():
                             "<div style='color:#3366ff; font-weight:bold;'>✍️ Generating human-friendly response...</div>",
                             unsafe_allow_html=True
                         )
-                    # Extract ranking criteria if applicable
                     ranking_criteria = ""
                     if any(keyword in prompt.lower() for keyword in
                            ['top', 'highest', 'most', 'maximum', 'best', 'largest', 'least', 'lowest', 'minimum']):
@@ -2294,33 +2361,33 @@ def main_app():
                     instructions = {
                         "role": "user",
                         "content": f"""      
-                                User Question: {prompt}        
-                                Database Query Result: {result_for_messages}
-                                SQL Query Used: {sql_query}
-                                {f"Ranking Criteria: {ranking_criteria}" if ranking_criteria else ""}
+                                    User Question: {prompt}        
+                                    Database Query Result: {result_for_messages}
+                                    SQL Query Used: {sql_query}
+                                    {f"Ranking Criteria: {ranking_criteria}" if ranking_criteria else ""}
 
-                                Instructions:       
-                                1. Directly use the database query result to answer the user's question.
+                                    Instructions:       
+                                    1. Directly use the database query result to answer the user's question.
 
-                                2. For ranking/top/maximum queries:
-                                   - Always mention the criteria used for ranking
-                                   - Use the "Ranking Criteria" provided above if available
-                                   - Include the metric value if available in the result
+                                    2. For ranking/top/maximum queries:
+                                       - Always mention the criteria used for ranking
+                                       - Use the "Ranking Criteria" provided above if available
+                                       - Include the metric value if available in the result
 
-                                3. Format guidelines:
-                                   - Use bullet points for better readability when there are many details
-                                   - Bold important values like names, amounts, and dates
-                                   - Keep monetary values properly formatted with commas
+                                    3. Format guidelines:
+                                       - Use bullet points for better readability when there are many details
+                                       - Bold important values like names, amounts, and dates
+                                       - Keep monetary values properly formatted with commas
 
-                                4. Do not include raw SQL or JSON in the response
+                                    4. Do not include raw SQL or JSON in the response
 
-                                5. Use chat history for context in follow-up questions
+                                    5. Use chat history for context in follow-up questions
 
-                                Examples:
-                                - "Top vendor by purchase orders" → "The top vendor is X with Y purchase orders"
-                                - "Highest spending project" → "Project X has the highest spending of $Y"
-                                - "Most active department" → "Department X is most active based on transaction count"
-                                """
+                                    Examples:
+                                    - "Top vendor by purchase orders" → "The top vendor is X with Y purchase orders"
+                                    - "Highest spending project" → "Project X has the highest spending of $Y"
+                                    - "Most active department" → "Department X is most active based on transaction count"
+                                    """
                     }
                     temp_messages = st.session_state.messages + [instructions]
                     natural_response, token_usage_second_call = get_groq_response_with_system(temp_messages)
@@ -2375,7 +2442,9 @@ def main_app():
                 with st.chat_message("assistant"):
                     formatted_html = format_llm_response(natural_response)
                     st.markdown(formatted_html, unsafe_allow_html=True)
-
+                    if st.session_state.last_sql_query:
+                        with st.expander("🔍 View SQL Query", expanded=False):
+                            st.code(st.session_state.last_sql_query, language='sql')
                     current_message_idx = len(
                         [m for m in st.session_state.chat_history if m["role"] == "assistant"]
                     ) - 1
@@ -2400,30 +2469,6 @@ def main_app():
             if 'final_message_placeholder' in locals():
                 final_message_placeholder.empty()
 
-            error_recovery = handle_ui_based_error_recovery(
-                sql_query if 'sql_query' in locals() else None,
-                {"error": str(e)},  # Pass error as dict
-                str(e),
-                schema_text,
-                get_groq_response_with_system,
-                st.session_state["user"]
-            )
-
-            if error_recovery["needs_clarification"]:
-                # Store the error recovery data
-                st.session_state.awaiting_error_clarification = True
-                st.session_state.error_clarification_data = {
-                    "filter_info": error_recovery["filter_info"],  # Changed from problematic_filter
-                    "original_sql": error_recovery["original_sql"],
-                    "original_prompt": prompt
-                }
-
-                # Show clarification message instead of error
-                st.session_state.messages.append({"role": "assistant", "content": error_recovery["message"]})
-                st.session_state.chat_history.append({"role": "assistant", "content": error_recovery["message"]})
-
-                save_after_exchange()
-                st.rerun()
             natural_response = f"Error: {str(e)}"
             save_query_result(
                 prompt,
